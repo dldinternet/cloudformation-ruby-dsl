@@ -35,17 +35,19 @@ end
 # Parse command-line arguments based on cfn-cmd syntax (cfn-create-stack etc.) and return the parameters and region
 def cfn_parse_args
   parameters = {}
-  region = 'us-east-1'
+  region = ENV['EC2_REGION'] || ENV['AWS_DEFAULT_REGION'] || 'us-east-1'
+  nopretty = false
   ARGV.slice_before(/^--/).each do |name, value|
-    next unless value
     case name
     when '--parameters'
       parameters = Hash[value.split(/;/).map { |pair| pair.split(/=/, 2) }]
     when '--region'
       region = value
+    when '--nopretty'
+      nopretty = true
     end
   end
-  [parameters, region]
+  [parameters, region, nopretty]
 end
 
 def cfn_cmd(template)
@@ -68,23 +70,31 @@ def cfn_cmd(template)
   # The command line string looks like: --tag "Key=key; Value=value" --tag "Key2=key2; Value2=value"
   cfn_tags_options = cfn_tags.sort.map { |tag| ["--tag", "Key=%s; Value=%s" % tag.split('=')] }.flatten
 
-  template_string = JSON.pretty_generate(template)
-
   # example: <template.rb> cfn-create-stack my-stack-name --parameters "Env=prod" --region eu-west-1
   # Execute the AWS CLI cfn-cmd command to validate/create/update a CloudFormation stack.
+  if action == 'diff' or (action == 'expand' and not template.nopretty)
+    template_string = JSON.pretty_generate(template)
+  else
+    template_string = JSON.generate(template)
+  end
+
+  if action == 'expand'
+    # Write the pretty-printed JSON template to stdout and exit.  [--nopretty] option writes output with minimal whitespace
+    # example: <template.rb> expand --parameters "Env=prod" --region eu-west-1 --nopretty
+    if template.nopretty
+      puts template_string
+    else
+      puts template_string
+    end
+    exit(true)
+  end
+
   temp_file = File.absolute_path("#{$PROGRAM_NAME}.expanded.json")
   File.write(temp_file, template_string)
 
   cmdline = ['cfn-cmd'] + ARGV + ['--template-file', temp_file] + cfn_tags_options
 
   case action
-  when 'expand'
-    # Write the pretty-printed JSON template to stdout.
-    # example: <template.rb> expand --parameters "Env=prod" --region eu-west-1
-    puts template_string
-    
-    exit(true)
-
   when 'diff'
     # example: <template.rb> diff my-stack-name --parameters "Env=prod" --region eu-west-1
     # Diff the current template for an existing stack with the expansion of this template.
@@ -103,7 +113,10 @@ def cfn_cmd(template)
 
     # Run CloudFormation commands to describe the existing stack
     cfn_options_string           = cfn_options.map { |arg| "'#{arg}'" }.join(' ')
-    old_template_string          = exec_capture_stdout("cfn-cmd cfn-get-template #{cfn_options_string}")
+    old_template_raw             = exec_capture_stdout("cfn-cmd cfn-get-template #{cfn_options_string}")
+    # ec2 template output is not valid json: TEMPLATE  "<json>\n"\n
+    old_template_object          = JSON.parse(old_template_raw[11..-3])
+    old_template_string          = JSON.pretty_generate(old_template_object)
     old_stack_attributes         = exec_describe_stack(cfn_options_string)
     old_tags_string              = old_stack_attributes["TAGS"]
     old_parameters_string        = old_stack_attributes["PARAMETERS"]
@@ -120,7 +133,7 @@ def cfn_cmd(template)
     old_temp_file = File.absolute_path("#{$PROGRAM_NAME}.current.json")
     new_temp_file = File.absolute_path("#{$PROGRAM_NAME}.expanded.json")
     File.write(old_temp_file, old_tags_string + old_parameters_string + old_template_string)
-    File.write(new_temp_file, tags_string + parameters_string + %Q(TEMPLATE  "#{template_string}\n"\n))
+    File.write(new_temp_file, tags_string + parameters_string + template_string)
 
     # Compare templates
     system(*["diff"] + diff_options + [old_temp_file, new_temp_file])
@@ -254,10 +267,10 @@ end
 
 # Core interpreter for the DSL
 class TemplateDSL < JsonObjectDSL
-  attr_reader :parameters, :aws_region
+  attr_reader :parameters, :aws_region, :nopretty
 
   def initialize()
-    @parameters, @aws_region = cfn_parse_args
+    @parameters, @aws_region, @nopretty = cfn_parse_args
     super
   end
 
